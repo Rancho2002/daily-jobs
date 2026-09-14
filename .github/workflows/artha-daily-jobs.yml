@@ -32,15 +32,17 @@ jobs:
               url = f"{BASE}?{params}"
               req = urllib.request.Request(url, headers={"X-API-Key": API_KEY})
               with urllib.request.urlopen(req, timeout=20) as resp:
-                  return json.load(resp)
+                  body = json.load(resp)
+                  # API wraps results as {"success":..., "data": {"items": [...]}}, not top-level "items"
+                  return (body.get("data") or {}).get("items", [])
 
           # Primary: remote jobs across India
-          remote = fetch("limit=10&location=IN&work_mode=remote&sort_by=newest").get("items", [])
+          remote = fetch("limit=10&location=IN&work_mode=remote&sort_by=newest")
 
           jobs = list(remote)
           if len(jobs) < 5:
               # Backfill with non-remote India jobs, newest first, remote ones stay first
-              backfill = fetch("limit=10&location=IN&sort_by=newest").get("items", [])
+              backfill = fetch("limit=10&location=IN&sort_by=newest")
               seen_ids = {j.get("id") for j in jobs}
               for j in backfill:
                   if j.get("id") not in seen_ids:

@@ -101,7 +101,10 @@ jobs:
               if salary:
                   block.append(f"Salary: {salary}")
               block.append("")
-              if j.get("url"):
+              slug = j.get("slug")
+              if slug:
+                  block.append(f"Apply: https://artha.link/@arijit_ghosh/jobs/{slug}")
+              elif j.get("url"):
                   block.append(f"Apply: {j['url']}")
               lines.append("\n".join(block))
 

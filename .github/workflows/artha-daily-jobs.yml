@@ -32,7 +32,6 @@ jobs:
           BASE = "https://api-india.artha.link/api/v1/jobs"
 
           MAX_JOBS = 10         # full list for the newsletter; trimmed by hand for LinkedIn
-          MIN_JOBS = 3          # below this, allow non-fresher jobs as backfill
           FETCH_LIMIT = 100     # API max; a wide pool gives enough fresher jobs to pick from
           SEEN_FILE = "jobs/seen_ids.json"
           SEEN_KEEP = 2000
@@ -107,30 +106,40 @@ jobs:
               except (TypeError, ValueError):
                   return None
 
+          # Priority (lower = shown first):
+          #   0 fresher / 0 yrs / intern, 1 = 1 yr, 2 = 2–5 yrs, 3 = experience not given, 4 = more than 5 yrs
+          def years_rank(n):
+              if n <= 0:
+                  return 0
+              if n <= 1:
+                  return 1
+              if n <= 5:
+                  return 2
+              return 4
+
           def exp_rank(j):
               lo = to_num(j.get("exp_min"))
               title = j.get("title") or ""
               if (j.get("job_type") or "").lower() == "internship":
                   return 0
               if lo is not None:
-                  if lo <= 0:
-                      return 0          # 0 years: the target audience
-                  if lo <= 1:
-                      return 1          # 1 year: close enough
-                  return 3              # experienced: backfill only
+                  return years_rank(lo)
+              # Only a max given ("up to N years"): freshers can apply if N is small
+              hi = to_num(j.get("exp_max"))
+              if hi is not None and hi <= 2:
+                  return 0 if hi <= 1 else 1
               # Experience not given: guess from the title, then the description
               if FRESHER_WORDS.search(title):
                   return 0
-              if SENIOR_WORDS.search(title):
-                  return 3
               desc = j.get("description") or ""
               years = [int(a or b) for a, b in YEARS_DESC.findall(desc) if int(a or b) <= 20]
               if years:
-                  lo = min(years)
-                  return 0 if lo == 0 else 1 if lo == 1 else 3
+                  return years_rank(min(years))
+              if SENIOR_WORDS.search(title):
+                  return 4
               if FRESHER_DESC.search(desc):
                   return 0
-              return 2
+              return 3
 
           def is_remote(j):
               return (j.get("work_mode") or "").lower() == "remote"
@@ -148,9 +157,7 @@ jobs:
           pool.sort(key=lambda j: j.get("posted_date") or "", reverse=True)
           pool.sort(key=lambda j: (exp_rank(j), 0 if is_remote(j) else 1))
 
-          jobs = [j for j in pool if exp_rank(j) <= 2][:MAX_JOBS]
-          if len(jobs) < MIN_JOBS:
-              jobs += [j for j in pool if exp_rank(j) == 3][: MIN_JOBS - len(jobs)]
+          jobs = pool[:MAX_JOBS]
 
           # --- Formatting helpers ---
           def fmt_num(v):
@@ -180,7 +187,9 @@ jobs:
                       return f"{fmt_num(lo)} {unit}"
                   rng = f"{fmt_num(lo)}–{fmt_num(hi)} {unit}"
                   return f"{rng} (Freshers eligible)" if lo == 0 else rng
-              return f"{fmt_num(lo if lo is not None else hi)}+ {unit}"
+              if lo is not None:
+                  return f"{fmt_num(lo)}+ {unit}"
+              return f"Up to {fmt_num(hi)} {unit} (Freshers eligible)"
 
           def indian_commas(n):
               s = str(int(round(n)))
@@ -310,11 +319,12 @@ jobs:
           summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
 
           # Diagnostics: how many jobs each feed returned, and the experience mix of the pool
-          RANK_NAMES = {0: "fresher / 0 yrs / intern", 1: "1 yr", 2: "exp not given", 3: "experienced"}
+          RANK_NAMES = {0: "fresher / 0 yrs / intern", 1: "1 yr", 2: "2–5 yrs", 3: "exp not given", 4: "5+ yrs"}
           diag = ["| Feed | Returned | New (not dupes / already posted) |", "|---|---|---|"]
           diag += [f"| `{p}` | {n} | {a} |" for p, n, a in feed_stats]
           diag += ["", "| Experience level | Jobs in pool |", "|---|---|"]
-          diag += [f"| {RANK_NAMES[r]} | {sum(1 for j in pool if exp_rank(j) == r)} |" for r in range(4)]
+          diag += [f"| {RANK_NAMES[r]} | {sum(1 for j in pool if exp_rank(j) == r)} |" for r in range(5)]
+          diag += ["", "Picked: " + ", ".join(RANK_NAMES[exp_rank(j)] for j in jobs)]
           diag_text = "\n".join(diag) + "\n\n"
           print(diag_text)
 

@@ -22,60 +22,161 @@ jobs:
           python3 - <<'PYEOF'
           import json
           import os
+          import re
+          import time
+          import urllib.error
           import urllib.request
           from datetime import datetime, timezone
 
           API_KEY = os.environ["ARTHA_API_KEY"]
           BASE = "https://api-india.artha.link/api/v1/jobs"
 
-          def fetch(params):
-              url = f"{BASE}?{params}"
+          MAX_JOBS = 10         # full list for the newsletter; trimmed by hand for LinkedIn
+          MIN_JOBS = 3          # below this, allow non-fresher jobs as backfill
+          FETCH_LIMIT = 100     # API max; a wide pool gives enough fresher jobs to pick from
+          SEEN_FILE = "jobs/seen_ids.json"
+          SEEN_KEEP = 2000
+
+          def fetch(params, offset=0):
+              url = f"{BASE}?limit={FETCH_LIMIT}&offset={offset}&{params}"
               req = urllib.request.Request(url, headers={"X-API-Key": API_KEY})
-              with urllib.request.urlopen(req, timeout=20) as resp:
-                  body = json.load(resp)
-                  # API wraps results as {"success":..., "data": {"items": [...]}}, not top-level "items"
-                  return (body.get("data") or {}).get("items", [])
+              for attempt in range(2):
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          body = json.load(resp)
+                          # API wraps results as {"success":..., "data": {"items": [...]}}, not top-level "items"
+                          return (body.get("data") or {}).get("items", [])
+                  except urllib.error.HTTPError as e:
+                      # 429 = rate limited; wait as told and retry once
+                      if e.code == 429 and attempt == 0:
+                          time.sleep(min(int(e.headers.get("Retry-After") or 10), 60))
+                          continue
+                      raise
 
-          # Primary: remote jobs across India
-          remote = fetch("limit=10&location=IN&work_mode=remote&sort_by=newest")
+          # --- Load previously posted job IDs so we don't repeat jobs ---
+          os.makedirs("jobs", exist_ok=True)
+          try:
+              with open(SEEN_FILE, encoding="utf-8") as f:
+                  seen = json.load(f)
+          except (FileNotFoundError, json.JSONDecodeError):
+              seen = []
+          seen_set = set(seen)
 
-          jobs = list(remote)
-          if len(jobs) < 5:
-              # Backfill with non-remote India jobs, newest first, remote ones stay first
-              backfill = fetch("limit=10&location=IN&sort_by=newest")
-              seen_ids = {j.get("id") for j in jobs}
-              for j in backfill:
-                  if j.get("id") not in seen_ids:
-                      jobs.append(j)
-                      seen_ids.add(j.get("id"))
-                  if len(jobs) >= 5:
-                      break
+          # --- Build candidate pool from several India feeds (the API has no experience filter) ---
+          pool, pool_ids = [], set()
 
-          jobs = jobs[:10]
+          def add_to_pool(items):
+              for j in items:
+                  jid = j.get("id")
+                  if jid in pool_ids or jid in seen_set:
+                      continue
+                  pool_ids.add(jid)
+                  pool.append(j)
+
+          for params in (
+              "location=IN&work_mode=remote&sort_by=newest",
+              "location=IN&job_type=internship&sort_by=newest",   # internships are fresher-friendly by definition
+              "location=IN&q=fresher&sort_by=newest",
+              "location=IN&sort_by=newest",
+          ):
+              add_to_pool(fetch(params))
+
+          # --- Fresher ranking: lower is better ---
+          FRESHER_WORDS = re.compile(r"\b(intern|internship|fresher|freshers|graduate|trainee|entry[- ]level|junior|jr)\b", re.I)
+          SENIOR_WORDS = re.compile(r"\b(senior|sr|lead|principal|staff|manager|head|architect|director)\b", re.I)
+
+          def to_num(v):
+              try:
+                  return float(v)
+              except (TypeError, ValueError):
+                  return None
+
+          def exp_rank(j):
+              lo = to_num(j.get("exp_min"))
+              title = j.get("title") or ""
+              if (j.get("job_type") or "").lower() == "internship":
+                  return 0
+              if lo is not None:
+                  if lo <= 0:
+                      return 0          # 0 years: the target audience
+                  if lo <= 1:
+                      return 1          # 1 year: close enough
+                  return 3              # experienced: backfill only
+              # Experience not given: guess from the title
+              if FRESHER_WORDS.search(title):
+                  return 0
+              if SENIOR_WORDS.search(title):
+                  return 3
+              return 2
+
+          def is_remote(j):
+              return (j.get("work_mode") or "").lower() == "remote"
+
+          # Not enough freshers in the first page? Look one page deeper in the all-India feed
+          if sum(1 for j in pool if exp_rank(j) <= 1) < MAX_JOBS:
+              add_to_pool(fetch("location=IN&sort_by=newest", offset=FETCH_LIMIT))
+
+          # Newest first, then (stable) freshers first, then remote first
+          pool.sort(key=lambda j: j.get("posted_date") or "", reverse=True)
+          pool.sort(key=lambda j: (exp_rank(j), 0 if is_remote(j) else 1))
+
+          jobs = [j for j in pool if exp_rank(j) <= 2][:MAX_JOBS]
+          if len(jobs) < MIN_JOBS:
+              jobs += [j for j in pool if exp_rank(j) == 3][: MIN_JOBS - len(jobs)]
+
+          # --- Formatting helpers ---
+          def fmt_num(v):
+              return f"{v:g}" if isinstance(v, float) else str(v)
 
           def fmt_location(j):
               parts = [p for p in [j.get("city"), j.get("state"), j.get("country")] if p]
               return ", ".join(parts)
 
           def fmt_experience(j):
-              lo, hi, unit = j.get("exp_min"), j.get("exp_max"), j.get("exp_unit") or "Years"
+              lo, hi = to_num(j.get("exp_min")), to_num(j.get("exp_max"))
+              unit = j.get("exp_unit") or "Years"
               if lo is None and hi is None:
                   return None
+              if lo == 0 and (hi is None or hi == 0):
+                  return "Fresher (0 Years)"
               if lo is not None and hi is not None:
-                  return f"{lo}–{hi} {unit}"
-              return f"{lo if lo is not None else hi} {unit}"
+                  if lo == hi:
+                      return f"{fmt_num(lo)} {unit}"
+                  rng = f"{fmt_num(lo)}–{fmt_num(hi)} {unit}"
+                  return f"{rng} (Freshers eligible)" if lo == 0 else rng
+              return f"{fmt_num(lo if lo is not None else hi)}+ {unit}"
+
+          def indian_commas(n):
+              s = str(int(round(n)))
+              if len(s) <= 3:
+                  return s
+              head, tail = s[:-3], s[-3:]
+              groups = []
+              while len(head) > 2:
+                  groups.insert(0, head[-2:])
+                  head = head[:-2]
+              if head:
+                  groups.insert(0, head)
+              return ",".join(groups) + "," + tail
 
           def fmt_salary(j):
-              lo, hi, curr = j.get("salary_min"), j.get("salary_max"), j.get("salary_curr") or ""
+              lo, hi = to_num(j.get("salary_min")), to_num(j.get("salary_max"))
+              curr = (j.get("salary_curr") or "").strip()
               if lo is None and hi is None:
                   return None
-              if lo is not None and hi is not None:
-                  return f"{curr}{lo} - {curr}{hi}"
-              return f"{curr}{lo if lo is not None else hi}"
+              vals = [v for v in (lo, hi) if v is not None]
+              if lo is not None and hi is not None and lo == hi:
+                  vals = [lo]
+              if curr.upper() in ("INR", "₹", "RS", "RS."):
+                  if all(v >= 100000 for v in vals):
+                      return "₹" + "–".join(f"{v / 100000:.1f}".rstrip("0").rstrip(".") for v in vals) + " LPA"
+                  return " – ".join(f"₹{indian_commas(v)}" for v in vals)
+              prefix = f"{curr} " if curr else ""
+              return " – ".join(f"{prefix}{v:,.0f}" for v in vals)
 
           def fmt_skills(j):
               skills = j.get("skills") or []
-              return " • ".join(skills) if skills else None
+              return " • ".join(str(s) for s in skills) if skills else None
 
           def fmt_job_block(i, j):
               company = j.get("company") or "A company"
@@ -107,9 +208,10 @@ jobs:
                   block.append(f"Apply: {j['url']}")
               return "\n".join(block)
 
-          # Keyword -> hashtag map, checked against each job's title + skills (case-insensitive)
+          # Keyword -> hashtag map, matched as whole words against each job's title + skills (case-insensitive)
           KEYWORD_HASHTAGS = [
-              ("machine learning", "#AIEngineering"), (" ai", "#AIEngineering"), ("artificial intelligence", "#AIEngineering"),
+              ("machine learning", "#AIEngineering"), ("ai", "#AIEngineering"), ("ml", "#AIEngineering"),
+              ("artificial intelligence", "#AIEngineering"),
               ("data", "#DataEngineering"),
               ("backend", "#BackendDeveloper"),
               ("frontend", "#FrontendDeveloper"),
@@ -121,30 +223,33 @@ jobs:
               ("network", "#NetworkEngineering"),
               ("python", "#PythonJobs"),
               ("java", "#JavaJobs"),
-              ("react", "#ReactJobs"), ("javascript", "#JavaScriptJobs"), ("node", "#NodeJS"),
+              ("react", "#ReactJobs"), ("javascript", "#JavaScriptJobs"), ("node", "#NodeJS"), ("nodejs", "#NodeJS"),
               ("android", "#AndroidDeveloper"), ("ios", "#iOSDeveloper"),
-              ("qa", "#QAJobs"), ("test", "#QAJobs"),
+              ("qa", "#QAJobs"), ("testing", "#QAJobs"), ("tester", "#QAJobs"), ("sdet", "#QAJobs"),
               ("product manager", "#ProductManagement"),
           ]
 
           def hashtags_for(batch):
-              tags = ["#TechJobs", "#HiringIndia", "#LinkedInJobs"]
+              tags = []
+              if any(exp_rank(j) == 0 for j in batch):
+                  tags.append("#FresherJobs")
+              tags += ["#TechJobs", "#HiringIndia", "#LinkedInJobs"]
               haystack = " ".join(
-                  (j.get("title") or "") + " " + " ".join(j.get("skills") or [])
+                  (j.get("title") or "") + " " + " ".join(str(s) for s in (j.get("skills") or []))
                   for j in batch
               ).lower()
               for keyword, tag in KEYWORD_HASHTAGS:
-                  if keyword in haystack and tag not in tags:
-                      tags.append(tag)
                   if len(tags) >= 8:
                       break
+                  if tag not in tags and re.search(rf"\b{re.escape(keyword)}\b", haystack):
+                      tags.append(tag)
               return " ".join(tags)
 
-          def build_file(batch, start_index):
-              if not batch:
-                  return None
-              header = "\U0001f6a8 Multiple Hiring Alert - Apply Now \U0001f6a8"
-              job_blocks = [fmt_job_block(start_index + i, j) for i, j in enumerate(batch)]
+          def build_post(batch):
+              fresher = all(exp_rank(j) <= 1 for j in batch)
+              label = ("Multiple " if len(batch) > 1 else "") + ("Fresher " if fresher else "") + "Hiring Alert"
+              header = f"\U0001f6a8 {label} - Apply Now \U0001f6a8"
+              job_blocks = [fmt_job_block(i + 1, j) for i, j in enumerate(batch)]
               footer = (
                   "Save this for later or send it to someone job hunting.\n\n"
                   "➕ Must follow and join my communities for more —\n"
@@ -154,21 +259,33 @@ jobs:
               )
               return header + "\n\n" + "\n\n".join(job_blocks) + "\n\n" + footer
 
-          output = build_file(jobs, 1) if jobs else "No jobs found today."
+          output = build_post(jobs) if jobs else None
+
           today = datetime.now(timezone.utc).date()
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          if not jobs:
+              print("No new jobs found today; nothing to commit.")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as f:
+                      f.write(f"# Artha Jobs — {today}\n\nNo new jobs found today.\n")
+              raise SystemExit(0)
 
           # Write to the Actions run summary (visible in the Actions tab immediately)
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary_path:
               with open(summary_path, "a", encoding="utf-8") as f:
                   f.write(f"# Artha Jobs — {today}\n\n")
+                  f.write(f"{len(jobs)} jobs, {len(output)} characters\n\n")
                   f.write("```\n" + output + "\n```\n")
 
-          # Also save a dated file into the repo for history
-          os.makedirs("jobs", exist_ok=True)
-          fname = f"jobs/{today}.md"
-          with open(fname, "w", encoding="utf-8") as f:
+          # Save a dated file into the repo for history
+          with open(f"jobs/{today}.md", "w", encoding="utf-8") as f:
               f.write(output + "\n")
+
+          # Remember what we posted so it isn't repeated tomorrow
+          seen += [j.get("id") for j in jobs if j.get("id") is not None]
+          with open(SEEN_FILE, "w", encoding="utf-8") as f:
+              json.dump(seen[-SEEN_KEEP:], f)
 
           print(output)
           PYEOF

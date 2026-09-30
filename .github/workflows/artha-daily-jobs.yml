@@ -83,18 +83,23 @@ jobs:
                   added += 1
               return added
 
+          # (q=fresher was dropped: the API seems to ignore q and return the plain newest feed)
           for params in (
               "location=IN&work_mode=remote&sort_by=newest",
               "location=IN&job_type=internship&sort_by=newest",   # internships are fresher-friendly by definition
-              "location=IN&q=fresher&sort_by=newest",
-              "location=IN&sort_by=newest",
           ):
               items = fetch(params)
               feed_stats.append((params, len(items), add_to_pool(items)))
 
           # --- Fresher ranking: lower is better ---
           FRESHER_WORDS = re.compile(r"\b(intern|internship|fresher|freshers|graduate|trainee|entry[- ]level|junior|jr)\b", re.I)
-          SENIOR_WORDS = re.compile(r"\b(senior|sr|lead|principal|staff|manager|head|architect|director)\b", re.I)
+          SENIOR_WORDS = re.compile(r"\b(senior|sr|lead|principal|staff|manager|head|architect|director|expert|l[2-5]|ii|iii|iv)\b", re.I)
+          # Fresher phrases and "N years of experience" patterns in the job description
+          FRESHER_DESC = re.compile(
+              r"\b(freshers?|fresh graduates?|recent graduates?|entry[- ]level|no (prior )?experience (is )?(required|needed))\b", re.I)
+          YEARS_DESC = re.compile(
+              r"(\d{1,2})\s*\+?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?\+?\s*(?:years?|yrs?)\b(?:\s+of)?(?:\s+[\w/-]+){0,3}?\s+experience"
+              r"|experience(?:\s*(?:[:\-–]|of|required))*\s*(?:minimum\s*|min\.?\s*|at least\s*)?(\d{1,2})\s*\+?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?\+?\s*(?:years?|yrs?)\b", re.I)
 
           def to_num(v):
               try:
@@ -113,20 +118,31 @@ jobs:
                   if lo <= 1:
                       return 1          # 1 year: close enough
                   return 3              # experienced: backfill only
-              # Experience not given: guess from the title
+              # Experience not given: guess from the title, then the description
               if FRESHER_WORDS.search(title):
                   return 0
               if SENIOR_WORDS.search(title):
                   return 3
+              desc = j.get("description") or ""
+              years = [int(a or b) for a, b in YEARS_DESC.findall(desc) if int(a or b) <= 20]
+              if years:
+                  lo = min(years)
+                  return 0 if lo == 0 else 1 if lo == 1 else 3
+              if FRESHER_DESC.search(desc):
+                  return 0
               return 2
 
           def is_remote(j):
               return (j.get("work_mode") or "").lower() == "remote"
 
-          # Not enough freshers in the first page? Look one page deeper in the all-India feed
-          if sum(1 for j in pool if exp_rank(j) <= 1) < MAX_JOBS:
-              items = fetch("location=IN&sort_by=newest", offset=FETCH_LIMIT)
-              feed_stats.append(("location=IN&sort_by=newest (page 2)", len(items), add_to_pool(items)))
+          # Page through the all-India feed until we have enough fresher jobs (max 5 pages = 500 jobs)
+          for page in range(5):
+              if sum(1 for j in pool if exp_rank(j) <= 1) >= MAX_JOBS:
+                  break
+              items = fetch("location=IN&sort_by=newest", offset=page * FETCH_LIMIT)
+              feed_stats.append((f"location=IN&sort_by=newest (page {page + 1})", len(items), add_to_pool(items)))
+              if len(items) < FETCH_LIMIT:
+                  break
 
           # Newest first, then (stable) freshers first, then remote first
           pool.sort(key=lambda j: j.get("posted_date") or "", reverse=True)

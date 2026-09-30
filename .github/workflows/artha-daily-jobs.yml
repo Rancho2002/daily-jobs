@@ -33,8 +33,6 @@ jobs:
 
           MAX_JOBS = 10         # full list for the newsletter; trimmed by hand for LinkedIn
           FETCH_LIMIT = 100     # API max; a wide pool gives enough fresher jobs to pick from
-          SEEN_FILE = "jobs/seen_ids.json"
-          SEEN_KEEP = 2000
 
           def fetch(params, offset=0):
               url = f"{BASE}?limit={FETCH_LIMIT}&offset={offset}&{params}"
@@ -52,14 +50,10 @@ jobs:
                           continue
                       raise
 
-          # --- Load previously posted job IDs so we don't repeat jobs ---
           os.makedirs("jobs", exist_ok=True)
-          try:
-              with open(SEEN_FILE, encoding="utf-8") as f:
-                  seen = json.load(f)
-          except (FileNotFoundError, json.JSONDecodeError):
-              seen = []
-          seen_set = set(seen)
+          # Old repeat-tracking file is no longer used; remove it (git add jobs/ stages the deletion)
+          if os.path.exists("jobs/seen_ids.json"):
+              os.remove("jobs/seen_ids.json")
 
           # --- Build candidate pool from several India feeds (the API has no experience filter) ---
           pool, pool_keys = [], set()
@@ -75,7 +69,7 @@ jobs:
               added = 0
               for j in items:
                   keys = dedupe_keys(j)
-                  if keys & pool_keys or j.get("id") in seen_set or j.get("slug") in seen_set:
+                  if keys & pool_keys:
                       continue
                   pool_keys.update(keys)
                   pool.append(j)
@@ -117,29 +111,33 @@ jobs:
                   return 2
               return 4
 
-          def exp_rank(j):
+          def exp_info(j):
+              """(priority group, estimated min years) — years is used to sort inside a group."""
               lo = to_num(j.get("exp_min"))
               title = j.get("title") or ""
               if (j.get("job_type") or "").lower() == "internship":
-                  return 0
+                  return 0, 0
               if lo is not None:
-                  return years_rank(lo)
+                  return years_rank(lo), lo
               # Only a max given ("up to N years"): freshers can apply if N is small
               hi = to_num(j.get("exp_max"))
               if hi is not None and hi <= 2:
-                  return 0 if hi <= 1 else 1
+                  return (0 if hi <= 1 else 1), 0
               # Experience not given: guess from the title, then the description
               if FRESHER_WORDS.search(title):
-                  return 0
+                  return 0, 0
+              if SENIOR_WORDS.search(title):
+                  return 4, 99      # a senior title outweighs smaller numbers in the description
               desc = j.get("description") or ""
               years = [int(a or b) for a, b in YEARS_DESC.findall(desc) if int(a or b) <= 20]
               if years:
-                  return years_rank(min(years))
-              if SENIOR_WORDS.search(title):
-                  return 4
+                  return years_rank(min(years)), min(years)
               if FRESHER_DESC.search(desc):
-                  return 0
-              return 3
+                  return 0, 0
+              return 3, 0
+
+          def exp_rank(j):
+              return exp_info(j)[0]
 
           def is_remote(j):
               return (j.get("work_mode") or "").lower() == "remote"
@@ -153,9 +151,9 @@ jobs:
               if len(items) < FETCH_LIMIT:
                   break
 
-          # Newest first, then (stable) freshers first, then remote first
+          # Newest first, then (stable) by group, fewest years required, remote first
           pool.sort(key=lambda j: j.get("posted_date") or "", reverse=True)
-          pool.sort(key=lambda j: (exp_rank(j), 0 if is_remote(j) else 1))
+          pool.sort(key=lambda j: (*exp_info(j), 0 if is_remote(j) else 1))
 
           jobs = pool[:MAX_JOBS]
 
@@ -320,7 +318,7 @@ jobs:
 
           # Diagnostics: how many jobs each feed returned, and the experience mix of the pool
           RANK_NAMES = {0: "fresher / 0 yrs / intern", 1: "1 yr", 2: "2–5 yrs", 3: "exp not given", 4: "5+ yrs"}
-          diag = ["| Feed | Returned | New (not dupes / already posted) |", "|---|---|---|"]
+          diag = ["| Feed | Returned | New (not dupes) |", "|---|---|---|"]
           diag += [f"| `{p}` | {n} | {a} |" for p, n, a in feed_stats]
           diag += ["", "| Experience level | Jobs in pool |", "|---|---|"]
           diag += [f"| {RANK_NAMES[r]} | {sum(1 for j in pool if exp_rank(j) == r)} |" for r in range(5)]
@@ -346,12 +344,6 @@ jobs:
           # Save a dated file into the repo for history
           with open(f"jobs/{today}.md", "w", encoding="utf-8") as f:
               f.write(output + "\n")
-
-          # Remember what we posted so it isn't repeated tomorrow
-          for j in jobs:
-              seen += [v for v in (j.get("id"), j.get("slug")) if v is not None]
-          with open(SEEN_FILE, "w", encoding="utf-8") as f:
-              json.dump(seen[-SEEN_KEEP:], f)
 
           print(output)
           PYEOF

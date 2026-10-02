@@ -32,6 +32,7 @@ jobs:
           BASE = "https://api-india.artha.link/api/v1/jobs"
 
           MAX_JOBS = 10         # full list for the newsletter; trimmed by hand for LinkedIn
+          MAX_PER_COMPANY = 2   # keep one company from filling the post
           FETCH_LIMIT = 100     # API max; a wide pool gives enough fresher jobs to pick from
 
           def fetch(params, offset=0):
@@ -142,6 +143,15 @@ jobs:
           def is_remote(j):
               return (j.get("work_mode") or "").lower() == "remote"
 
+          # Employers who hide their name show up with placeholder company names
+          HIDDEN_COMPANY = re.compile(r"^(anonymous|confidential|undisclosed|not disclosed|n/?a|unknown|hidden|private)?$", re.I)
+
+          def company_hidden(j):
+              return bool(HIDDEN_COMPANY.match((j.get("company") or "").strip()))
+
+          def norm_title(j):
+              return re.sub(r"[^a-z0-9]", "", (j.get("title") or "").lower())
+
           # Page through the all-India feed until we have enough fresher jobs (max 5 pages = 500 jobs)
           for page in range(5):
               if sum(1 for j in pool if exp_rank(j) <= 1) >= MAX_JOBS:
@@ -151,11 +161,23 @@ jobs:
               if len(items) < FETCH_LIMIT:
                   break
 
-          # Newest first, then (stable) by group, fewest years required, remote first
+          # Newest first, then (stable) by group, fewest years required, named company first, remote first
           pool.sort(key=lambda j: j.get("posted_date") or "", reverse=True)
-          pool.sort(key=lambda j: (*exp_info(j), 0 if is_remote(j) else 1))
+          pool.sort(key=lambda j: (*exp_info(j), 1 if company_hidden(j) else 0, 0 if is_remote(j) else 1))
 
-          jobs = pool[:MAX_JOBS]
+          # Take the top jobs, but no more than MAX_PER_COMPANY from any one company for variety
+          jobs, per_company = [], {}
+          for j in pool:
+              company = " ".join((j.get("company") or "").lower().split())
+              if company and per_company.get(company, 0) >= MAX_PER_COMPANY:
+                  continue
+              # A hidden-company job with the same title as one already picked is usually the same opening reposted
+              if company_hidden(j) and any(norm_title(p) == norm_title(j) for p in jobs):
+                  continue
+              per_company[company] = per_company.get(company, 0) + 1
+              jobs.append(j)
+              if len(jobs) >= MAX_JOBS:
+                  break
 
           # --- Formatting helpers ---
           def fmt_num(v):
@@ -163,14 +185,18 @@ jobs:
 
           def fmt_location(j):
               parts, seen_parts = [], set()
-              for p in (j.get("city"), j.get("state"), j.get("country")):
-                  if not p:
-                      continue
-                  p = "India" if p.strip().upper() == "IN" else p.strip()
-                  if p.lower() in seen_parts:
-                      continue   # avoids "India, India, India"
-                  seen_parts.add(p.lower())
-                  parts.append(p)
+              for field in (j.get("city"), j.get("state"), j.get("country")):
+                  # A single field can itself be "India, India", so split before de-duplicating
+                  for p in str(field or "").split(","):
+                      p = " ".join(p.split())   # also collapses odd whitespace
+                      if not p:
+                          continue
+                      if p.upper() == "IN":
+                          p = "India"
+                      if p.lower() in seen_parts:
+                          continue   # avoids "India, India, India"
+                      seen_parts.add(p.lower())
+                      parts.append(p)
               return ", ".join(parts)
 
           def fmt_experience(j):
@@ -187,6 +213,8 @@ jobs:
                   return f"{rng} (Freshers eligible)" if lo == 0 else rng
               if lo is not None:
                   return f"{fmt_num(lo)}+ {unit}"
+              if hi == 1:
+                  unit = unit.rstrip("sS")   # "1 year", not "1 years"
               return f"Up to {fmt_num(hi)} {unit} (Freshers eligible)"
 
           def indian_commas(n):
@@ -228,10 +256,12 @@ jobs:
 
           def fmt_skills(j):
               skills = j.get("skills") or []
-              return " • ".join(str(s) for s in skills) if skills else None
+              skills = [" ".join(str(s).split()) for s in skills]
+              skills = [s for s in skills if s]
+              return " • ".join(skills) if skills else None
 
           def fmt_job_block(i, j):
-              company = j.get("company") or "A company"
+              company = "Confidential company" if company_hidden(j) else j["company"].strip()
               title = j.get("title")
               block = [f"{i}) {company} is hiring!", ""]
               if title:
